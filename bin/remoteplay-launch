@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# remoteplay-launch — (re)inicia Steam con -pipewire dentro de la sesión Plasma/Wayland activa.
+# Funciona por SSH: detecta solo WAYLAND_DISPLAY, DISPLAY, XAUTHORITY y el bus de D-Bus.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Uso: remoteplay-launch [opciones]
+
+  --silent       Arranca Steam minimizado en la bandeja (-silent)
+  --no-restart   No cierra una instancia de Steam ya abierta (si está abierta, no hace nada)
+  --delay N      Espera N segundos antes de lanzar (útil en autostart)
+  -h, --help     Muestra esta ayuda
+EOF
+}
+
+SILENT=0; RESTART=1; DELAY=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --silent) SILENT=1 ;;
+    --no-restart) RESTART=0 ;;
+    --delay) shift; DELAY=${1:-0} ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Opción desconocida: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+for cand in "$SELF_DIR/../lib/env.sh" "$HOME/.local/lib/fedora-mac-remoteplay/env.sh"; do
+  if [ -f "$cand" ]; then
+    # shellcheck source=../lib/env.sh
+    . "$cand"; break
+  fi
+done
+command -v rp_detect_env >/dev/null 2>&1 || { echo "No encuentro lib/env.sh; reinstala con ./install.sh" >&2; exit 1; }
+
+if [ "$DELAY" -gt 0 ] 2>/dev/null; then sleep "$DELAY"; fi
+
+if ! rp_have_graphical_session; then
+  rp_err "No hay una sesión gráfica de Plasma activa (¿el PC está en la pantalla de login?)."
+  rp_err "Inicia sesión en el PC o activa el inicio de sesión automático (./install.sh --autologin)."
+  exit 1
+fi
+
+if ! rp_steam_cmd; then
+  rp_err "No encuentro Steam (ni nativo ni Flatpak). Instálalo primero."
+  exit 1
+fi
+
+if rp_session_locked; then
+  echo "AVISO: la pantalla del PC está bloqueada; el stream saldrá en negro hasta que la desbloquees." >&2
+fi
+
+if pgrep -x steam >/dev/null 2>&1; then
+  if [ "$RESTART" = 0 ]; then
+    echo "Steam ya está en ejecución; no se reinicia (--no-restart)."
+    exit 0
+  fi
+  echo "Cerrando Steam…"
+  "${STEAM_CMD[@]}" -shutdown >/dev/null 2>&1 || true
+  for _ in $(seq 1 15); do pgrep -x steam >/dev/null 2>&1 || break; sleep 1; done
+  pkill -x steam >/dev/null 2>&1 || true
+  sleep 2
+fi
+
+ARGS=(-pipewire)
+if [ "$SILENT" = 1 ]; then ARGS+=(-silent); fi
+
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/fedora-mac-remoteplay"
+mkdir -p "$LOG"
+echo "Lanzando Steam (${STEAM_KIND}) con: ${ARGS[*]}"
+nohup setsid "${STEAM_CMD[@]}" "${ARGS[@]}" >"$LOG/steam.log" 2>&1 &
+
+for _ in $(seq 1 30); do
+  if pgrep -x steam >/dev/null 2>&1; then
+    echo "Steam en ejecución. Log: $LOG/steam.log"
+    exit 0
+  fi
+  sleep 1
+done
+
+rp_err "Steam no arrancó. Últimas líneas del log:"
+tail -n 15 "$LOG/steam.log" >&2 || true
+exit 1

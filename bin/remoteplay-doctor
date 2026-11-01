@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# remoteplay-doctor — diagnostica por qué Steam Remote Play da pantalla negra o no conecta.
+set -uo pipefail
+
+SELF_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+for cand in "$SELF_DIR/../lib/env.sh" "$HOME/.local/lib/fedora-mac-remoteplay/env.sh"; do
+  if [ -f "$cand" ]; then
+    # shellcheck source=../lib/env.sh
+    . "$cand"; break
+  fi
+done
+command -v rp_detect_env >/dev/null 2>&1 || { echo "No encuentro lib/env.sh" >&2; exit 1; }
+
+FAILS=0; WARNS=0
+ok()   { printf '  [ OK ] %s\n' "$*"; }
+warn() { printf '  [WARN] %s\n' "$*"; WARNS=$((WARNS+1)); }
+fail() { printf '  [FAIL] %s\n' "$*"; FAILS=$((FAILS+1)); }
+hint() { printf '         -> %s\n' "$*"; }
+section() { printf '\n== %s ==\n' "$*"; }
+
+rp_detect_env
+
+section "Sistema"
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  ok "${PRETTY_NAME:-desconocido}"
+  if [ "${ID:-}" != "fedora" ]; then warn "No es Fedora; el instalador no está pensado para esta distro."; fi
+fi
+if [ "${XDG_CURRENT_DESKTOP:-}" != "" ] && [ "${XDG_CURRENT_DESKTOP:-}" != "KDE" ]; then
+  warn "Escritorio: ${XDG_CURRENT_DESKTOP} (se espera KDE)."
+fi
+
+section "Sesión gráfica"
+if rp_have_graphical_session; then
+  ok "Wayland: $WAYLAND_DISPLAY (runtime: $XDG_RUNTIME_DIR)"
+else
+  fail "No hay sesión Wayland activa. ¿El PC está en la pantalla de login?"
+  hint "Inicia sesión en el PC o usa ./install.sh --autologin"
+fi
+if [ -n "${DISPLAY:-}" ] && [ -n "${XAUTHORITY:-}" ]; then
+  ok "XWayland: DISPLAY=$DISPLAY, XAUTHORITY=$(basename "$XAUTHORITY")"
+else
+  warn "No detecto XWayland/XAUTHORITY: Steam puede fallar con 'Unable to open X11 display'."
+fi
+if rp_session_locked; then
+  fail "La pantalla está BLOQUEADA: el stream saldrá en negro."
+  hint "Desbloquéala y desactiva el bloqueo (./install.sh lo hace por ti)."
+else
+  ok "Pantalla desbloqueada"
+fi
+
+section "Steam"
+if rp_steam_cmd; then
+  ok "Steam instalado (${STEAM_KIND})"
+else
+  fail "No encuentro Steam."
+  hint "Instálalo desde RPM Fusion (nonfree) o Flatpak."
+fi
+if pgrep -x steam >/dev/null 2>&1; then
+  if pgrep -ax steam >/dev/null 2>&1 && tr '\0' ' ' </proc/"$(pgrep -x steam | head -n1)"/cmdline 2>/dev/null | grep -q -- '-pipewire'; then
+    ok "Steam corre con -pipewire"
+  else
+    fail "Steam corre SIN -pipewire (captura Wayland no habilitada)."
+    hint "Ejecuta: remoteplay-launch"
+  fi
+else
+  warn "Steam no está en ejecución."
+  hint "Ejecuta: remoteplay-launch"
+fi
+
+section "Servicios de captura (PipeWire / portal)"
+for u in pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde; do
+  if systemctl --user is-active --quiet "$u" 2>/dev/null; then ok "$u activo"; else warn "$u no está activo"; fi
+done
+
+section "Red"
+if systemctl is-active --quiet sshd 2>/dev/null; then ok "sshd activo"; else warn "sshd inactivo (necesario para controlar el PC desde el Mac)."; fi
+if systemctl is-active --quiet firewalld 2>/dev/null; then
+  ports=$(firewall-cmd --list-ports 2>/dev/null || true)
+  case $ports in
+    *27031-27036/udp*) ok "Firewall: UDP 27031-27036 abierto" ;;
+    *) fail "Firewall: faltan puertos de Remote Play"; hint "sudo firewall-cmd --permanent --add-port=27031-27036/udp --add-port=27036-27037/tcp && sudo firewall-cmd --reload" ;;
+  esac
+else
+  ok "firewalld no está activo (sin bloqueo de puertos)"
+fi
+
+section "Codificación de video por hardware"
+if command -v vainfo >/dev/null 2>&1; then
+  if vainfo 2>/dev/null | grep -qE 'VAProfileH264.*EncSlice'; then
+    ok "VAAPI puede codificar H.264 por hardware"
+  else
+    warn "VAAPI NO puede codificar H.264: Steam usará x264 por CPU (más latencia)."
+    hint "En Fedora instala los drivers 'freeworld' de RPM Fusion: ./install.sh --codecs"
+  fi
+else
+  warn "vainfo no instalado (sudo dnf install libva-utils)"
+fi
+
+section "Último stream (log de Steam)"
+SLOG="$HOME/.local/share/Steam/logs/streaming_log.txt"
+if [ -f "$SLOG" ]; then
+  if grep -q 'Desktop Black Frame' "$SLOG"; then warn "El último stream usó 'Desktop Black Frame' (captura sin imagen)."; fi
+  if grep -q 'Created encoder X264' "$SLOG"; then warn "El último stream usó x264 por CPU (sin aceleración por hardware)."; fi
+  if grep -qi 'pipewire.*\(fail\|error\)' "$SLOG"; then warn "Hay errores de PipeWire en streaming_log.txt"; fi
+  ok "Log revisado: $SLOG"
+else
+  warn "Aún no hay streaming_log.txt (no se ha hecho ninguna transmisión)."
+fi
+
+printf '\nResumen: %d fallo(s), %d aviso(s).\n' "$FAILS" "$WARNS"
+[ "$FAILS" -eq 0 ]

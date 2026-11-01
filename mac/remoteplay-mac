@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# remoteplay-mac — controla desde tu Mac el PC Fedora que hace de host de Steam Remote Play.
+set -euo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fedora-mac-remoteplay"
+CONF="$CONF_DIR/config"
+REMOTE_BIN='$HOME/.local/bin'   # se expande en el PC remoto, no aquí
+
+usage() {
+  cat <<'EOF'
+Uso: remoteplay-mac <comando> [args]
+
+  setup [usuario@host]   Configura SSH con clave y guarda el PC (una sola vez)
+  up                     Reinicia Steam en el PC con -pipewire y abre Steam/Steam Link aquí
+  down                   Cierra Steam en el PC
+  status | doctor        Ejecuta el diagnóstico en el PC (remoteplay-doctor)
+  ssh                    Abre una terminal SSH al PC
+  open                   Solo abre Steam / Steam Link en este Mac
+EOF
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+load_conf() {
+  [ -f "$CONF" ] || die "Aún no hay PC configurado. Ejecuta: remoteplay-mac setup usuario@IP"
+  # shellcheck disable=SC1090
+  . "$CONF"
+  [ -n "${RP_HOST:-}" ] || die "Config inválida en $CONF"
+}
+
+rssh() { ssh -o ConnectTimeout=8 -o BatchMode=yes "$RP_HOST" "$@"; }
+
+open_steam() {
+  if [ -d "/Applications/Steam Link.app" ]; then open -a "Steam Link"
+  elif [ -d "/Applications/Steam.app" ]; then open -a "Steam"
+  else
+    echo "No encuentro Steam Link ni Steam en este Mac."
+    echo "Instala 'Steam Link' desde la App Store, o:  brew install --cask steam"
+  fi
+}
+
+cmd_setup() {
+  local target=${1:-}
+  if [ -z "$target" ]; then read -r -p "Usuario y host del PC (ej. neko@192.168.1.20): " target; fi
+  case $target in *@*) ;; *) die "Usa el formato usuario@host" ;; esac
+
+  if [ ! -f "$HOME/.ssh/id_ed25519" ] && [ ! -f "$HOME/.ssh/id_rsa" ]; then
+    echo "Creando una clave SSH…"
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+    ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
+  fi
+
+  echo "Copiando tu clave al PC (te pedirá la contraseña del PC una vez)…"
+  ssh-copy-id "$target"
+
+  mkdir -p "$CONF_DIR"
+  printf 'RP_HOST=%q\n' "$target" >"$CONF"
+  echo "Guardado en $CONF"
+
+  echo "Comprobando que el PC tiene los scripts instalados…"
+  if ssh -o BatchMode=yes "$target" "test -x $REMOTE_BIN/remoteplay-launch"; then
+    echo "OK. Ya puedes usar:  remoteplay-mac up"
+  else
+    echo "El PC no tiene remoteplay-launch. En el PC ejecuta ./install.sh del repositorio."
+  fi
+
+  if [ ! -d "/Applications/Steam Link.app" ] && [ ! -d "/Applications/Steam.app" ]; then
+    echo
+    echo "Falta el cliente en el Mac: instala 'Steam Link' (App Store) o  brew install --cask steam"
+  fi
+  echo
+  echo "Recuerda: Ajustes del Sistema > Privacidad y seguridad > Red local > activa Steam / Steam Link."
+}
+
+cmd_up() {
+  load_conf
+  echo "Iniciando Steam con -pipewire en $RP_HOST…"
+  rssh "$REMOTE_BIN/remoteplay-launch" || die "No se pudo lanzar Steam en el PC. Prueba: remoteplay-mac doctor"
+  open_steam
+  echo "Listo: elige tu PC en Steam Link / Steam > Remote Play y lanza el juego."
+}
+
+cmd_down() {
+  load_conf
+  rssh "pkill -x steam || true"
+  echo "Steam cerrado en el PC."
+}
+
+cmd_doctor() {
+  load_conf
+  rssh "$REMOTE_BIN/remoteplay-doctor"
+}
+
+case ${1:-} in
+  setup) shift; cmd_setup "${1:-}" ;;
+  up) cmd_up ;;
+  down) cmd_down ;;
+  status|doctor) cmd_doctor ;;
+  ssh) load_conf; exec ssh "$RP_HOST" ;;
+  open) open_steam ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac
